@@ -32,6 +32,22 @@ edit the files:
 
 This command will build the execution environment of the ML pipeline and will automate the tracking process.
 
+## Building the web-UI
+
+This step requires the installation of the following packages using the pip tool:
+
+`pip3 install ipywidgets pandas matplotlib seaborn scikit-learn aif360[all]`
+
+If the installation of "aif360[all]" fails due to setuptools, follow the next steps:
+
+
+```bash 
+pip3 install --upgrade pip setuptools wheel
+sudo apt install r-base
+pip3 install rpy2
+pip3 install aif360[all]
+```
+
 ## Running the web-UI
 
 Under the folder:
