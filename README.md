@@ -23,7 +23,7 @@ Under the folder:
 
 edit the files:
 - run_mlflow.py: Setup the IP and PORT variables regarding the MLFlow tracking server in lines 28 & 29
-- run_experiments_parallel: Setup the IP and PORT variables regarding the MLFlow tracking server in lines 12 & 13
+- run_experiments_parallel.py: Setup the IP and PORT variables regarding the MLFlow tracking server in lines 12 & 13
 
 
 ## Building the docker image:
