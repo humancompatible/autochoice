@@ -1,0 +1,44 @@
+.my-font {
+    font-family: optima;
+    font-size: medium;
+}
+
+.circular {
+    border-radius: 50% !important;  /* Make the button circular */
+}
+
+.my-radio-style > .widget-radio-box label {
+    font-family: optima;
+    font-size: large !important;
+}
+
+.my-radio-style > .widget-label {
+    font-family: optima;
+    font-size: 20px !important;
+}
+
+.my-int-text .widget-label {
+    font-family: optima;
+    font-size: 20px !important;
+    color: #333333;
+}
+.my-int-text .widget-text input[type="number"] {
+    border-radius: 12px !important;
+    font-family: optima;
+    font-size: 20px !important;
+    width: 150px !important;  /* Set a predefined width */
+    border: 2px solid #ccc !important;  /* Define border width and color */
+    padding: 5px !important;
+    margin: 0 !important;
+}    
+
+.my-select-multiple .widget-label {
+    font-family: optima;
+    font-size: 18px !important;
+    color: #333333;
+}
+.my-select-multiple .widget-select option {
+    font-family: optima;
+    font-size: 16px !important;
+    color: #333333;
+}
