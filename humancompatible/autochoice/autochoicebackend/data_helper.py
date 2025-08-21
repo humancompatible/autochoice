@@ -171,3 +171,88 @@ def load_custom_dataset(
     unprivileged_groups = [{"is_privileged": 0}]
     return data, aif_data, privileged_groups, unprivileged_groups, target_label_name
 
+def load_openml_adult(
+    random_seed: int = 42,
+    train_size: float = 0.7,
+    build_pipeline: bool = True,
+    return_aif360: bool = True,
+    protected_for_aif: str = "sex",
+    favorable_label_for_aif: str = ">50K",
+) -> Dict[str, Any]:
+    """Load the OpenML Adult dataset with optional AIF360 dataset and sklearn pipeline."""
+    if fetch_adult is None:
+        raise RuntimeError("AIF360 sklearn OpenML loaders are unavailable. Install the appropriate extras.")
+
+    X, y, sample_weight = fetch_adult()
+    df = X.copy()
+    df["income"] = y
+
+    drop_cols = ["income"]
+    if return_aif360:
+        drop_cols.append(protected_for_aif)
+    df = df.dropna(subset=drop_cols)
+
+    y_series = df["income"]
+    X_df = df.drop(columns=["income"])
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_df, y_series, train_size=train_size, random_state=random_seed, stratify=y_series
+    )
+
+    categorical_features = X_df.select_dtypes(include=["object", "category"]).columns.to_list()
+    onehot = ColumnTransformer(
+        transformers=[("one-hot-encoder", OneHotEncoder(handle_unknown="ignore"), categorical_features)],
+        remainder="passthrough",
+    )
+
+    result: Dict[str, Any] = {
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "categorical_features": categorical_features,
+    }
+
+    if build_pipeline:
+        model = Pipeline(
+            steps=[
+                ("one-hot-encoder", onehot),
+                ("clf", LogisticRegression(max_iter=1500)),
+            ]
+        )
+        result["pipeline"] = model
+
+    if return_aif360:
+        if protected_for_aif not in df.columns:
+            raise KeyError(f"Protected attribute '{protected_for_aif}' not in Adult dataset.")
+
+        if protected_for_aif == "sex":
+            protected_indicator = (df["sex"].astype(str).str.lower() == "male").astype(int)
+        else:
+            top_cat = df[protected_for_aif].astype(str).mode().iloc[0]
+            protected_indicator = (df[protected_for_aif].astype(str) == top_cat).astype(int)
+
+        df_aif = df.copy()
+        df_aif["is_privileged"] = protected_indicator
+        df_aif["income_binary"] = (df_aif["income"] == favorable_label_for_aif).astype(int)
+
+        aif_data = _convert_to_standard_dataset(
+            df=df_aif.drop(columns=["income"]),
+            target_label_name="income_binary",
+            favorable_classes=[1],
+            protected_is_privileged_col="is_privileged",
+            categorical_infer=True,
+            scores_name="",
+        )
+        privileged_groups = [{"is_privileged": 1}]
+        unprivileged_groups = [{"is_privileged": 0}]
+
+        result.update(
+            {
+                "aif_data": aif_data,
+                "privileged_groups": privileged_groups,
+                "unprivileged_groups": unprivileged_groups,
+            }
+        )
+
+    return result
+
