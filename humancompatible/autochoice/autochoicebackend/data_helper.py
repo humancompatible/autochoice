@@ -273,3 +273,72 @@ def load_compas_dataset() -> Tuple[StandardDataset, List[Dict[str, int]], List[D
 
     target_label = compas.label_names[0] if compas.label_names else "two_year_recid"
     return compas, privileged_groups, unprivileged_groups, target_label
+
+
+
+def init_mlflow_from_cfg(cfg: DictConfig) -> None:
+    """Initialize MLflow strictly from a Hydra/OmegaConf config.
+
+    Expected YAML structure under ``mlflow``:
+      tracking_uri: "http://mlflow:5000"
+      registry_uri: null
+      experiment_name: "legal-matching"
+      autolog: true
+      flavor: "sklearn"   # or "all", "pytorch", "xgboost", ...
+      env: { ... }        # optional env vars
+    """
+    if not hasattr(cfg, "mlflow"):
+        raise RuntimeError("Config missing 'mlflow' section.")
+
+    mlcfg = cfg.mlflow
+
+    env: Optional[Mapping[str, Any]] = mlcfg.get("env")
+    if env:
+        for k, v in env.items():
+            os.environ[str(k)] = str(v)
+
+    tracking_uri = mlcfg.get("tracking_uri")
+    if not tracking_uri:
+        raise RuntimeError("cfg.mlflow.tracking_uri is required.")
+    mlflow.set_tracking_uri(tracking_uri)
+
+    registry_uri = mlcfg.get("registry_uri")
+    if registry_uri:
+        mlflow.set_registry_uri(registry_uri)
+
+    experiment_name = mlcfg.get("experiment_name")
+    if experiment_name:
+        mlflow.set_experiment(experiment_name)
+
+    if mlcfg.get("autolog", True):
+        flavor = mlcfg.get("flavor", "sklearn")
+        try:
+            if flavor == "sklearn":
+                import mlflow.sklearn as mls; mls.autolog()
+            elif flavor == "pytorch":
+                import mlflow.pytorch as mlpt; mlpt.autolog()
+            elif flavor == "xgboost":
+                import mlflow.xgboost as mlx; mlx.autolog()
+            elif flavor == "lightgbm":
+                import mlflow.lightgbm as mll; mll.autolog()
+            elif flavor == "catboost":
+                import mlflow.catboost as mlc; mlc.autolog()
+            elif flavor == "fastai":
+                import mlflow.fastai as mlf; mlf.autolog()
+            elif flavor == "transformers":
+                import mlflow.transformers as mlt; mlt.autolog()
+            elif flavor == "all":
+                mlflow.autolog()
+            else:
+                mlflow.autolog()
+        except Exception:
+            mlflow.autolog()
+
+
+def mlflow_client_from_cfg(cfg: DictConfig) -> MlflowClient:
+    """Create an MlflowClient that matches Hydra config."""
+    init_mlflow_from_cfg(cfg)
+    return MlflowClient(
+        tracking_uri=cfg.mlflow.tracking_uri,
+        registry_uri=cfg.mlflow.get("registry_uri"),
+    )
