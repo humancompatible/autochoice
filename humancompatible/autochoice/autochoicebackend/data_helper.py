@@ -101,3 +101,73 @@ def _convert_to_standard_dataset(
         categorical_features=categorical_features,
         features_to_keep=selected_features,
     )
+
+
+def load_custom_dataset(
+    dataset_path: str = "/data/dataset1M.parquet",
+    function_filter_value: str = "Legal",
+    target_from: str = "automatch_score",
+    target_bins: Tuple[float, float, float] = (0.6, 0.85, np.inf),
+    target_label_name: str = "target_class",
+    protected_attribute: str = "experiences_no",
+    protected_threshold: int = 2,
+) -> Tuple[pd.DataFrame, StandardDataset, List[Dict[str, int]], List[Dict[str, int]], str]:
+    """Load and prepare the custom parquet dataset.
+
+    Steps:
+      1) Read schema, exclude heavy/unused columns, ensure ``job.function`` present.
+      2) Filter rows where ``job.function == function_filter_value``.
+      3) Create multiclass target from ``automatch_score`` via ``target_bins``.
+      4) Create ``is_privileged`` from ``protected_attribute`` threshold.
+      5) Convert to AIF360 StandardDataset (favorable class = 2).
+
+    Returns:
+        (processed_df, aif_data, privileged_groups, unprivileged_groups, target_label_name)
+    """
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset not found at {dataset_path}.")
+
+    df_schema = pd.read_parquet(dataset_path, engine="pyarrow", columns=None)
+    all_columns = df_schema.columns.tolist()
+    exclude = [
+        "skills",
+        "job.remote",
+        "job.id",
+        "job.account_id",
+        "applicant_id",
+        "job.education",
+        "job.account_name",
+    ]
+    include_columns = [c for c in all_columns if c not in exclude]
+    if "job.function" not in include_columns:
+        include_columns.append("job.function")
+
+    data = pd.read_parquet(dataset_path, columns=include_columns)
+    data.columns = data.columns.str.strip().str.lower()
+
+    if "job.function" not in data.columns:
+        raise KeyError("Column 'job.function' not found in dataset.")
+    data = data[data["job.function"] == function_filter_value].drop(columns=["job.function"])
+
+    if target_from not in data.columns:
+        raise KeyError(f"Column '{target_from}' not found in dataset.")
+    bins = [-np.inf, target_bins[0], target_bins[1], target_bins[2]]
+    data[target_label_name] = pd.cut(data[target_from], bins=bins, labels=[0, 1, 2]).astype(int)
+
+    if protected_attribute not in data.columns:
+        raise KeyError(f"Protected attribute '{protected_attribute}' not found in dataset.")
+    data["is_privileged"] = (data[protected_attribute] > protected_threshold).astype(int)
+
+    aif_data = _convert_to_standard_dataset(
+        df=data,
+        target_label_name=target_label_name,
+        favorable_classes=[2],
+        protected_is_privileged_col="is_privileged",
+        categorical_infer=True,
+        scores_name="",
+    )
+
+    privileged_groups = [{"is_privileged": 1}]
+    unprivileged_groups = [{"is_privileged": 0}]
+    return data, aif_data, privileged_groups, unprivileged_groups, target_label_name
+
