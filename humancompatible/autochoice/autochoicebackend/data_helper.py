@@ -256,3 +256,20 @@ def load_openml_adult(
 
     return result
 
+def load_compas_dataset() -> Tuple[StandardDataset, List[Dict[str, int]], List[Dict[str, int]], str]:
+    """Load the COMPAS dataset via AIF360."""
+    try:
+        from aif360.datasets import CompasDataset
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("AIF360 CompasDataset unavailable. Install AIF360 with datasets extras.") from e
+
+    compas = CompasDataset()
+    if "sex" in compas.protected_attribute_names:
+        privileged_groups = [{"sex": 1}]
+        unprivileged_groups = [{"sex": 0}]
+    else:
+        privileged_groups = [{"race": 1}]
+        unprivileged_groups = [{"race": 0}]
+
+    target_label = compas.label_names[0] if compas.label_names else "two_year_recid"
+    return compas, privileged_groups, unprivileged_groups, target_label
