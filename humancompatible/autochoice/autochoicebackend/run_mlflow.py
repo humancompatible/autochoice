@@ -1,105 +1,86 @@
+"""
+main
+====
+
+Hydra-only MLflow init, dataset dispatch (adult|compas|custom), FLAML tuning,
+MAPIE conformal prediction, and AIF360 fairness post/post metrics logging.
+
+Usage:
+    python main.py <dataset_name> <preprocessing_name> <postprocessing_name> [search_algo]
+
+Examples:
+    python main.py custom Reweighing EqOddsPostprocessing tpe
+    python main.py adult Reweighing CalibratedEqOddsPostprocessing rand
+    python main.py compas Reweighing RejectOptionClassification
+"""
+
+from __future__ import annotations
+
 import os
 import sys
-import mlflow
+import time
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 import torch
+import mlflow
 from flaml import AutoML
 from hyperopt import fmin, tpe, rand, hp, Trials
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from mapie.classification import MapieClassifier
+
 from aif360.datasets import StandardDataset
 from aif360.algorithms.preprocessing import Reweighing
-from aif360.algorithms.postprocessing import EqOddsPostprocessing, CalibratedEqOddsPostprocessing, RejectOptionClassification
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from mapie.classification import MapieClassifier
-from sklearn.ensemble import RandomForestClassifier
-import time
+from aif360.algorithms.postprocessing import (
+    EqOddsPostprocessing,
+    CalibratedEqOddsPostprocessing,
+    RejectOptionClassification,
+)
+from aif360.metrics import ClassificationMetric
 
-#  GPU Check
+from hydra import initialize, compose
+from omegaconf import DictConfig
+
+from data_helper import (
+    init_mlflow_from_cfg,
+    load_custom_dataset,
+    load_openml_adult,
+    load_compas_dataset,
+)
+
+# -------------------------
+# GPU / environment info
+# -------------------------
 USE_GPU = torch.cuda.is_available()
 if USE_GPU:
-    print(f"GPU Available: {torch.cuda.get_device_name(0)}")
+    print(f"\U0001F680 GPU Available: {torch.cuda.get_device_name(0)}")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 else:
-    print("No GPU detected, using CPU.")
+    print("⚠️ No GPU detected, using CPU.")
+
+print("MLFLOW version: ")
+print(mlflow.__version__)
 
 
-# IP and PORT of MLFlow Tracking Server
-IP = ""
-PORT = "5000"
+# ---------------------------------------------------------------------------
+# Fairness utilities
+# ---------------------------------------------------------------------------
 
-# MLflow Setup
-MLFLOW_TRACKING_URI = f"http://{IP}:{PORT}"
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-mlflow.sklearn.autolog()
-
-# Load Dataset
-DATASET_PATH = "/data/datasetfile.csv"
-if not os.path.exists(DATASET_PATH):
-    raise FileNotFoundError(f"Dataset not found at {DATASET_PATH}.")
-data = pd.read_csv(DATASET_PATH)
-
-# Normalize column names
-data.columns = data.columns.str.strip().str.lower()
-
-# Show column types and unique values
-print("\n Data Types and Categories:")
-for col in data.columns:
-    dtype = data[col].dtype
-    col_type = "categorical" if dtype == object else "numerical"
-    print(f"{col}: {dtype} ({col_type})")
-
-#  Define target label and protected attribute
-TARGET_LABEL = "job.remote"
-PROTECTED_ATTRIBUTE = "experiences_no"
-PROTECTED_THRESHOLD = data[PROTECTED_ATTRIBUTE].median()
-
-print(f"\n Using '{PROTECTED_ATTRIBUTE}' as protected attribute (numerical).")
-print(f"   ➤ Privileged group: {PROTECTED_ATTRIBUTE} <= {PROTECTED_THRESHOLD}")
-print(f"   ➤ Unprivileged group: {PROTECTED_ATTRIBUTE} > {PROTECTED_THRESHOLD}")
-
-def convert_to_standard_dataset(df, target_label_name, scores_name=""):
-    protected_attributes = [PROTECTED_ATTRIBUTE]
-    selected_features = df.columns.tolist()
-
-    categorical_features = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    for col in categorical_features:
-        df[col] = df[col].astype("category").cat.codes
-
-    if df[target_label_name].dtype == bool:
-        df[target_label_name] = df[target_label_name].astype(int)
-
-    df["is_privileged"] = (df[PROTECTED_ATTRIBUTE] <= PROTECTED_THRESHOLD).astype(int)
-    protected_attributes = ["is_privileged"]
-
-    dataset = StandardDataset(
-        df=df,
-        label_name=target_label_name,
-        favorable_classes=[1],
-        scores_name=scores_name,
-        protected_attribute_names=protected_attributes,
-        privileged_classes=[[1]],
-        categorical_features=categorical_features,
-        features_to_keep=selected_features + ["is_privileged"]
-    )
-
-    if scores_name == "":
-        dataset.scores = dataset.labels.copy()
-    return dataset
-
-#  Convert
-aif_data = convert_to_standard_dataset(data, target_label_name=TARGET_LABEL)
-
-#  Redefine groups
-privileged_groups = [{"is_privileged": 1}]
-unprivileged_groups = [{"is_privileged": 0}]
-
-def apply_preprocessing(preprocessing_name, dataset):
+def apply_preprocessing(preprocessing_name: str, dataset: StandardDataset) -> StandardDataset:
+    """Apply AIF360 preprocessing (currently Reweighing)."""
     if preprocessing_name == "Reweighing":
         return Reweighing(privileged_groups, unprivileged_groups).fit_transform(dataset)
     raise ValueError(f"Unsupported preprocessing method: {preprocessing_name}")
 
-def apply_postprocessing(postprocessing_name, dataset_true, dataset_pred):
+
+def apply_postprocessing(
+    postprocessing_name: str,
+    dataset_true: StandardDataset,
+    dataset_pred: StandardDataset,
+) -> StandardDataset:
+    """Apply AIF360 postprocessing."""
     if postprocessing_name == "EqOddsPostprocessing":
         model = EqOddsPostprocessing(privileged_groups, unprivileged_groups)
     elif postprocessing_name == "CalibratedEqOddsPostprocessing":
@@ -113,11 +94,17 @@ def apply_postprocessing(postprocessing_name, dataset_true, dataset_pred):
         )
     else:
         raise ValueError(f"Unsupported postprocessing method: {postprocessing_name}")
+
     model.fit(dataset_true, dataset_pred)
     return model.predict(dataset_pred)
 
-def log_fairness_metrics(dataset_before, dataset_after, prefix=""):
-    from aif360.metrics import ClassificationMetric
+
+def log_fairness_metrics(
+    dataset_before: StandardDataset,
+    dataset_after: StandardDataset,
+    prefix: str = "",
+) -> None:
+    """Compute and log fairness metrics to MLflow."""
     metric = ClassificationMetric(dataset_before, dataset_after, unprivileged_groups, privileged_groups)
     metrics = {
         "statistical_parity_difference": metric.statistical_parity_difference(),
@@ -127,22 +114,29 @@ def log_fairness_metrics(dataset_before, dataset_after, prefix=""):
         "theil_index": metric.theil_index(),
     }
     for k, v in metrics.items():
-        mlflow.log_metric(f"{prefix}{k}", v)
+        mlflow.log_metric(f"{prefix}{k}", float(v))
         print(f"{prefix}{k}: {v:.4f}")
 
+
+# ---------------------------------------------------------------------------
+# FLAML search space and objective
+# ---------------------------------------------------------------------------
+
 search_space = {
-    'time_budget': hp.uniform('time_budget', 1, 3),
-    'metric': hp.choice('metric', ['accuracy']),
-    'estimator_list': hp.choice('estimator_list', [['lgbm', 'xgboost']])
+    "time_budget": hp.uniform("time_budget", 10, 30),
+    "metric": hp.choice("metric", ["accuracy"]),
+    "estimator_list": hp.choice("estimator_list", [["lgbm"]]),
 }
 
-def objective(params):
+
+def objective(params: Dict[str, Any]) -> float:
+    """Hyperopt objective: train FLAML model, log metrics, fairness postprocess."""
     automl_settings = {
-        "time_budget": int(params['time_budget']),
+        "time_budget": int(params["time_budget"]),
         "task": "classification",
-        "estimator_list": params['estimator_list'],
-        "metric": params['metric'],
-        "verbose": 0
+        "estimator_list": params["estimator_list"],
+        "metric": params["metric"],
+        "verbose": 0,
     }
     if USE_GPU:
         automl_settings["use_gpu"] = True
@@ -151,59 +145,59 @@ def objective(params):
     automl.fit(X_train, y_train, **automl_settings)
     best_model = automl.model
 
-    #  Inference time measurement
+    if best_model is None:
+        raise RuntimeError("❌ AutoML failed to return a model.")
+
     start = time.time()
     _ = best_model.predict(X_test)
     automl_inference_time = time.time() - start
 
     acc = accuracy_score(y_test, best_model.predict(X_test))
+    mlflow.log_metric("automl_inference_time", float(automl_inference_time))
+    mlflow.log_metric("automl_accuracy", float(acc))
 
-    #  Log and compare
-    result_df = pd.DataFrame([
-        ["Baseline RandomForest", baseline_acc, baseline_inference_time],
-        ["AutoML Optimized", acc, automl_inference_time]
-    ], columns=["Model", "Accuracy", "Inference Time"])
+    print("\n📈 Model Comparison:")
+    print(pd.DataFrame([["AutoML Optimized", acc, automl_inference_time]],
+                       columns=["Model", "Accuracy", "Inference Time"]))
 
-    print("\n Model Comparison:")
-    print(result_df)
-    mlflow.log_metric("automl_inference_time", automl_inference_time)
-    mlflow.log_metric("automl_accuracy", acc)
-    mlflow.log_artifact(result_df.to_csv("model_comparison.csv", index=False))
-
-    mapie = MapieClassifier(estimator=best_model, method="score")
-    mapie.fit(X_train, y_train)
-    y_pred_mapie, _ = mapie.predict(X_test, alpha=0.1)
-    conformal_coverage = np.mean(y_pred_mapie != -1)
-    mlflow.log_metric("conformal_coverage", conformal_coverage)
+    try:
+        mapie = MapieClassifier(estimator=best_model, method="score")
+        mapie.fit(X_train, y_train.ravel())
+        y_pred_mapie, _ = mapie.predict(X_test, alpha=0.1)
+        coverage = float(np.mean(y_pred_mapie != -1))
+        mlflow.log_metric("conformal_coverage", coverage)
+    except Exception as e:
+        print(f"❌ MAPIE failed: {repr(e)}")
+        mlflow.log_metric("conformal_coverage", -1.0)
 
     pred_dataset = preprocessed_data.copy()
     pred_dataset.labels = best_model.predict(preprocessed_data.features).reshape(-1, 1)
-    postprocessed_data = apply_postprocessing(postprocessing_name, preprocessed_data, pred_dataset)
-    log_fairness_metrics(preprocessed_data, postprocessed_data, prefix="postprocessed_")
+    postprocessed_ds = apply_postprocessing(postprocessing_name, preprocessed_data, pred_dataset)
+    log_fairness_metrics(preprocessed_data, postprocessed_ds, prefix="postprocessed_")
 
     return -acc
 
-def run_experiment(preprocessing_name, postprocessing_name, search_algo):
-    with mlflow.start_run():
-        mlflow.log_param("preprocessing_algorithm", preprocessing_name)
-        mlflow.log_param("postprocessing_algorithm", postprocessing_name)
 
-        global preprocessed_data, X_train, X_test, y_train, y_test, baseline_acc, baseline_inference_time
-        preprocessed_data = apply_preprocessing(preprocessing_name, aif_data)
+# ---------------------------------------------------------------------------
+# Experiment runner and dataset dispatch
+# ---------------------------------------------------------------------------
+
+def run_experiment(preprocessing_name_arg: str, postprocessing_name_arg: str, search_algo: str) -> None:
+    """Run a single MLflow experiment and log fairness metrics."""
+    with mlflow.start_run():
+        mlflow.log_param("preprocessing_algorithm", preprocessing_name_arg)
+        mlflow.log_param("postprocessing_algorithm", postprocessing_name_arg)
+
+        global preprocessed_data, X_train, X_test, y_train, y_test
+        preprocessed_data = apply_preprocessing(preprocessing_name_arg, aif_data)
 
         X_train, X_test, y_train, y_test = train_test_split(
-            preprocessed_data.features, preprocessed_data.labels.ravel(), test_size=0.2, random_state=42
+            preprocessed_data.features,
+            preprocessed_data.labels.ravel(),
+            test_size=0.2,
+            random_state=42,
+            stratify=preprocessed_data.labels.ravel() if len(np.unique(preprocessed_data.labels.ravel())) > 1 else None,
         )
-
-        #  Baseline model
-        baseline_rf = RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42)
-        baseline_rf.fit(X_train, y_train)
-        start = time.time()
-        _ = baseline_rf.predict(X_test)
-        baseline_inference_time = time.time() - start
-        baseline_acc = accuracy_score(y_test, baseline_rf.predict(X_test))
-        mlflow.log_metric("baseline_inference_time", baseline_inference_time)
-        mlflow.log_metric("baseline_accuracy", baseline_acc)
 
         log_fairness_metrics(aif_data, aif_data, prefix="raw_")
         log_fairness_metrics(preprocessed_data, preprocessed_data, prefix="preprocessed_")
@@ -215,8 +209,76 @@ def run_experiment(preprocessing_name, postprocessing_name, search_algo):
         for key, value in best_params.items():
             mlflow.log_param(key, str(value))
 
+
+def load_dataset_dispatch(dataset_name: str, cfg: DictConfig) -> Tuple[StandardDataset, List[Dict[str, int]], List[Dict[str, int]], str]:
+    """Dispatch dataset loading by name: custom | adult | compas."""
+    name = dataset_name.lower()
+
+    if name == "custom":
+        dataset_path = cfg.get("data", {}).get("path", "/data/dataset1M.parquet")
+        function_filter = cfg.get("data", {}).get("function_filter_value", "Legal")
+        protected_attr = cfg.get("data", {}).get("protected_attribute", "experiences_no")
+        protected_threshold = int(cfg.get("data", {}).get("protected_threshold", 2))
+
+        _, aif, pg, ug, target_label = load_custom_dataset(
+            dataset_path=dataset_path,
+            function_filter_value=function_filter,
+            target_from="automatch_score",
+            target_bins=(0.6, 0.85, np.inf),
+            target_label_name="target_class",
+            protected_attribute=protected_attr,
+            protected_threshold=protected_threshold,
+        )
+        return aif, pg, ug, target_label
+
+    if name == "adult":
+        info = load_openml_adult(
+            random_seed=42,
+            train_size=0.7,
+            build_pipeline=False,
+            return_aif360=True,
+            protected_for_aif=cfg.get("data", {}).get("adult_protected_attr", "sex"),
+            favorable_label_for_aif=cfg.get("data", {}).get("adult_favorable_label", ">50K"),
+        )
+        return info["aif_data"], info["privileged_groups"], info["unprivileged_groups"], "income_binary"
+
+    if name == "compas":
+        info = load_compas_dataset()
+        return info
+
+    raise ValueError(f"Unknown dataset '{dataset_name}'. Use one of: custom, adult, compas.")
+
+
+# ---------------------------------------------------------------------------
+# __main__
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    preprocessing_name = sys.argv[1]
-    postprocessing_name = sys.argv[2]
-    search_algo = sys.argv[3] if len(sys.argv) > 3 else "tpe"
+    if len(sys.argv) < 4:
+        print(
+            "Usage: python main.py <dataset_name> <preprocessing_name> <postprocessing_name> [search_algo]\n"
+            "  dataset_name: custom | adult | compas\n"
+            "  preprocessing_name: Reweighing\n"
+            "  postprocessing_name: EqOddsPostprocessing | CalibratedEqOddsPostprocessing | RejectOptionClassification\n"
+            "  search_algo: tpe | rand   (default: tpe)"
+        )
+        sys.exit(1)
+
+    dataset_name = sys.argv[1]
+    preprocessing_name = sys.argv[2]
+    postprocessing_name = sys.argv[3]
+    search_algo = sys.argv[4] if len(sys.argv) > 4 else "tpe"
+
+    with initialize(version_base=None, config_path="."):
+        cfg: DictConfig = compose(config_name="config")
+
+    init_mlflow_from_cfg(cfg)
+    print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
+
+    aif_data, privileged_groups, unprivileged_groups, TARGET_LABEL = load_dataset_dispatch(dataset_name, cfg)
+
+    print(f"\n🎯 Using target label: '{TARGET_LABEL}'")
+    print(f"🛡️ Privileged groups: {privileged_groups}")
+    print(f"🛡️ Unprivileged groups: {unprivileged_groups}")
+
     run_experiment(preprocessing_name, postprocessing_name, search_algo)
