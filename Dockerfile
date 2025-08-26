@@ -7,7 +7,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     R_HOME=/usr/lib/R \
     RPY2_CFFI_MODE=ABI
 
-
+# ---- System packages ----
+# - r-base + r-base-dev for rpy2 (pulled by aif360[all])
+# - libtirpc-dev fixes the exact link error you hit (-ltirpc)
+# - cairo dev libs used by igraph[cairo]/cairocffi (pulled by [all])
+# - toolchain + BLAS/LAPACK for scientific stack
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gfortran \
@@ -31,9 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-
 
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install \
@@ -52,7 +53,9 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       mapie==0.9.2 \
       hydra-core==1.3.2 \
       omegaconf==2.3.0 && \
+    # CPU-only Torch; change to CUDA wheels if you’ll use GPU
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu && \
+    # Optional extras you had
     pip install tensorflow==2.20.0 inFairness aix360
 
 
@@ -63,6 +66,7 @@ WORKDIR /app
 
 COPY dataset1M.parquet /data/
 #COPY model.pkl /data/
+COPY config.yaml .
 COPY data_helper.py .
 COPY run_mlflow.py .
 
