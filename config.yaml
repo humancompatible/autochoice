@@ -1,0 +1,13 @@
+mlflow:
+  tracking_uri: "http://192.168.1.151:5000"
+  registry_uri: null
+  experiment_name: "AutoFairToolkit"
+  autolog: true
+  flavor: "sklearn"
+  env:
+    # Optional S3 / TLS / proxies, etc.
+    # MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+    # AWS_ACCESS_KEY_ID: "minioadmin"
+    # AWS_SECRET_ACCESS_KEY: "minioadmin"
+    # MLFLOW_TRACKING_INSECURE_TLS: "true"
+
