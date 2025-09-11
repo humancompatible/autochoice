@@ -1,3 +1,4 @@
+# Use Python 3.9 to match TensorFlow 2.20 and your pins
 FROM python:3.10
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -35,7 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
 
+
+# ---- Python dependencies ----
+# Keep your original pins; add pyarrow/hydra; install aif360[all] after system deps
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install \
       numpy==1.23.5 \
@@ -61,6 +66,11 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 
 # ✅ Install AIX360 for explainability
 RUN pip install --no-cache-dir aix360
+
+
+RUN pip install --no-cache-dir \
+    "git+https://github.com/humancompatible/explain.git@7406b59"
+
 
 WORKDIR /app
 
