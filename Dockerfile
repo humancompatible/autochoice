@@ -71,6 +71,9 @@ RUN pip install --no-cache-dir aix360
 RUN pip install --no-cache-dir \
     "git+https://github.com/humancompatible/explain.git@7406b59"
 
+RUN pip install --no-cache-dir \
+    "git+https://github.com/humancompatible/detect.git@93f8f32"
+
 
 WORKDIR /app
 
