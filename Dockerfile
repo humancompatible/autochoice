@@ -1,4 +1,4 @@
-FROM python:3.9
+FROM python:3.10
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
