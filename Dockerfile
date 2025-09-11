@@ -75,6 +75,13 @@ RUN pip install --no-cache-dir \
     "git+https://github.com/humancompatible/detect.git@93f8f32"
 
 
+RUN pip install --no-cache-dir \
+    "git+https://github.com/humancompatible/repair.git@3d08622a943df5f697bd0ec1b1f061ac99e1cdbf"
+
+# Optional: create output dirs used by the repo's examples/plots
+RUN mkdir -p /app/plots /app/data
+
+
 WORKDIR /app
 
 COPY dataset1M.parquet /data/
