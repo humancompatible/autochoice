@@ -17,13 +17,14 @@ Features:
 The toolkit provides a Dockerfile that builds the image containing the necessary execution environment for the evaluation process as well as exposes a Web-UI to simplify the execution of a machine learning pipeline.
 
 ## Setting up MLFlow Tracking Server
-Under the folder:
+Simply edit the 
 
-`autochoice/autochoicebackend`
+`config.yaml`
 
-edit the files:
-- run_mlflow.py: Setup the IP and PORT variables regarding the MLFlow tracking server in lines 28 & 29
-- run_experiments_parallel.py: Setup the IP and PORT variables regarding the MLFlow tracking server in lines 12 & 13
+file and set the tracking_uri variable in the form of "http://IP:PORT"
+
+e.g.
+`tracking_uri: "http://192.168.1.151:5000"`
 
 
 ## Building the docker image:
@@ -58,3 +59,11 @@ run the following command:
 
 `voila autofairui.ipynb --no-browser --port=8888 --Voila.ip=0.0.0.0`
 
+
+## References
+
+If you use the Autochoice toolkit in your work, please cite the following work:
+
+```bibtex
+TBC
+```
