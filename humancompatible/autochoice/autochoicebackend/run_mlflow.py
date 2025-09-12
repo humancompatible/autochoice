@@ -7,6 +7,7 @@ MAPIE conformal prediction, AIF360 fairness pre/post metrics logging — plus:
 
 - FACTS-only experiment for bias detection (dataset-agnostic).
 - GLANCE experiment for global counterfactual actions (dataset-agnostic).
+- DETECT experiment (MSD / L∞ histogram gap) for subgroup bias discovery.
 
 Usage
 -----
@@ -21,6 +22,10 @@ FACTS bias scan only (skip pre/post): pass 'FACTS' as the 3rd arg:
 GLANCE global actions only (skip pre/post): pass 'GLANCE' as the 3rd arg:
 
     python run_mlflow.py <dataset_name> _ GLANCE
+
+DETECT (MSD / L∞) bias scan only (skip pre/post): pass 'DETECT' as the 3rd arg:
+
+    python run_mlflow.py <dataset_name> _ DETECT
 """
 
 from __future__ import annotations
@@ -57,11 +62,20 @@ from aif360.datasets import StandardDataset
 from aif360.metrics import ClassificationMetric
 from aif360.sklearn.detectors.facts import FACTS_bias_scan
 
-# GLANCE (Global Actions) — documented at:
-# https://humancompatible-explain.readthedocs.io/en/latest/glance.html
+# GLANCE (Global Actions)
 from humancompatible.explain.glance.iterative_merges.iterative_merges import (  # type: ignore
     C_GLANCE,
     format_glance_output,
+)
+
+# DETECT (MSD & L∞ helpers)
+from humancompatible.detect.helpers.utils import (  # type: ignore
+    detect_and_score,
+    evaluate_subgroup_discrepancy,
+    signed_subgroup_discrepancy,
+)
+from humancompatible.detect.methods.msd.mapping_msd import (  # type: ignore
+    subgroup_map_from_conjuncts_dataframe,
 )
 
 from hydra import compose, initialize
@@ -760,7 +774,6 @@ def _serialize_actions_for_artifact(global_actions: Any) -> Union[List[Dict[str,
                 return {"value": str(x)}
             return [_to_dict(x) for x in global_actions]
         if isinstance(global_actions, dict):
-            # Convert Series values
             out = {}
             for k, v in global_actions.items():
                 if isinstance(v, pd.Series):
@@ -802,11 +815,6 @@ def run_glance_experiment(dataset_name: str, cfg: DictConfig) -> None:
         ``glance_total_effectiveness``, ``glance_total_cost``.
     MLflow artifacts:
         ``glance_clusters.json`` (per-cluster stats) and ``glance_global_actions.json`` (final actions).
-
-    See Also
-    --------
-    humancompatible.explain.glance.iterative_merges.iterative_merges.C_GLANCE
-        Method documentation and parameters.
     """
     # --- Load & prepare ---
     aif, _, _, _ = load_dataset_dispatch(dataset_name, cfg)
@@ -914,7 +922,6 @@ def run_glance_experiment(dataset_name: str, cfg: DictConfig) -> None:
         mlflow.log_param("glance_clustering_method", clustering_method)
         mlflow.log_param("glance_cf_generator", cf_generator)
         mlflow.log_param("glance_action_choice_algo", cluster_action_choice_algo)
-        mlflow.log_param("glance_favorable_value_for_binarization", favorable_val_logged)
 
         # Metrics
         mlflow.log_metric("glance_total_effectiveness", float(total_effectiveness))
@@ -943,6 +950,208 @@ def run_glance_experiment(dataset_name: str, cfg: DictConfig) -> None:
     print(f"\n🌐 GLANCE — total_effectiveness={total_effectiveness:.4f}, total_cost={total_cost:.4f}")
     if clusters_stats is not None:
         print("Top-level cluster stats logged to MLflow artifact 'glance_clusters.json'.")
+
+
+# ---------------------------------------------------------------------------
+# DETECT-only (MSD / L∞ histogram gap) — dataset-agnostic
+# ---------------------------------------------------------------------------
+
+def _choose_protected_and_continuous(
+    df: pd.DataFrame,
+    attrs: Dict[str, Any],
+    cfg: DictConfig,
+    label_name: str,
+) -> Tuple[List[str], List[str]]:
+    """
+    Choose protected attributes and continuous-protected columns for DETECT.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Full dataframe (features + label).
+    attrs : dict
+        Metadata returned by ``StandardDataset.convert_to_dataframe``.
+    cfg : DictConfig
+        Hydra configuration (may contain a ``detect`` section).
+    label_name : str
+        Name of the label column (to be excluded).
+
+    Returns
+    -------
+    protected_list : list of str
+        Protected attribute columns to audit.
+    continuous_list : list of str
+        Subset of ``protected_list`` treated as continuous (binned by DETECT).
+
+    Notes
+    -----
+    - If ``cfg.detect.protected_attributes`` is provided, it is used.
+    - Else fall back to ``attrs['protected_attribute_names']``.
+    - Continuous features are inferred as numeric dtypes among the protected list,
+      unless ``cfg.detect.continuous_attributes`` overrides.
+    """
+    dcfg = cfg.get("detect", {}) if hasattr(cfg, "get") else {}
+    explicit = dcfg.get("protected_attributes")
+    if explicit:
+        protected_list = [c for c in explicit if c in df.columns and c != label_name]
+    else:
+        protected_list = [c for c in (attrs.get("protected_attribute_names") or []) if c in df.columns]
+    if not protected_list:
+        raise ValueError(
+            "DETECT requires at least one protected attribute. "
+            "Set cfg.detect.protected_attributes or ensure the AIF dataset exposes them."
+        )
+
+    cont_override = dcfg.get("continuous_attributes")
+    if cont_override:
+        continuous_list = [c for c in cont_override if c in protected_list]
+    else:
+        continuous_list = [c for c in protected_list if pd.api.types.is_numeric_dtype(df[c])]
+    return protected_list, continuous_list
+
+
+def _pretty_rule(rule: List[Tuple[int, Any]]) -> str:
+    """
+    Convert a DETECT rule list into a human-readable string.
+
+    Parameters
+    ----------
+    rule : list[tuple[int, Any]]
+        The rule as returned by ``detect_and_score`` (index, Bin) pairs.
+
+    Returns
+    -------
+    str
+        Human-readable conjunction such as ``"Race = Blue AND Age in [30,40)"``.
+
+    Notes
+    -----
+    The ``Bin`` objects implement ``__str__``; we print each conjunct with AND.
+    """
+    try:
+        return " AND ".join(str(cond) for _, cond in (rule or [])) or "(empty subgroup)"
+    except Exception:
+        return str(rule)
+
+
+def run_detect_experiment(dataset_name: str, cfg: DictConfig) -> None:
+    """
+    Run HumanCompatible.Detect to find the most biased subgroup and score it.
+
+    The procedure mirrors the quick-start usage and helper API:
+      1. Load an AIF dataset, convert to pandas.
+      2. Select protected attributes (from config or dataset metadata).
+      3. Call ``detect_and_score`` with method ``"MSD"`` (or ``"l_inf"``).
+      4. Build a boolean mask of the subgroup and re-evaluate signed/absolute gaps.
+      5. Log result and rule to MLflow + save rule artifact.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Dataset key (``"custom"``, ``"adult"``, ``"compas"``).
+    cfg : DictConfig
+        Hydra configuration with an optional ``detect`` section:
+
+        - ``method``: ``"MSD"`` (default) or ``"l_inf"``.
+        - ``seed``: random seed for subsampling/solver (optional).
+        - ``n_samples``: cap on rows for subsampling (default: 1_000_000).
+        - ``method_kwargs``: dict with MSD knobs (e.g., ``time_limit``, ``n_min``, ``solver``).
+        - ``protected_attributes``: override list of protected columns (optional).
+        - ``continuous_attributes``: subset of protected treated as continuous (optional).
+
+    Logs
+    ----
+    MLflow params:
+        method, protected_list, continuous_list, n_samples, seed, method_kwargs.
+    MLflow metrics:
+        ``detect_value`` (MSD or L∞), ``detect_abs_delta``, ``detect_signed_delta``,
+        ``detect_support``, ``detect_support_frac``.
+    MLflow artifact:
+        ``detect_rule.json`` with both raw and human-readable rule.
+    """
+    # --- Load dataset & pick columns ---
+    aif, _, _, _ = load_dataset_dispatch(dataset_name, cfg)
+    df, attrs = aif.convert_to_dataframe(de_dummy_code=True)
+    label_name = attrs["label_names"][0]
+
+    protected_list, continuous_list = _choose_protected_and_continuous(df, attrs, cfg, label_name)
+
+    # --- Prepare inputs for detect_and_score ---
+    X = df[protected_list]
+    y = df[label_name]
+
+    dcfg = cfg.get("detect", {}) if hasattr(cfg, "get") else {}
+    method = str(dcfg.get("method", "MSD"))
+    n_samples = int(dcfg.get("n_samples", 1_000_000))
+    seed = dcfg.get("seed", None)
+    method_kwargs = dcfg.get("method_kwargs", None)
+
+    # --- Run detection ---
+    # detect_and_score returns (rule, value); rule is list[(feature_index, Bin)]
+    rule, value = detect_and_score(
+        X=X,
+        y=y,
+        protected_list=protected_list,
+        continuous_list=continuous_list,
+        fp_map=None,
+        seed=seed,
+        n_samples=n_samples,
+        method=method,
+        method_kwargs=method_kwargs,
+    )
+
+    pretty = _pretty_rule(rule)
+
+    # Build subgroup mask & recompute signed/absolute deltas
+    mask = subgroup_map_from_conjuncts_dataframe(rule, X)
+    abs_delta = float(evaluate_subgroup_discrepancy(mask, y.to_numpy().astype(bool)))
+    signed_delta = float(signed_subgroup_discrepancy(mask, y.to_numpy().astype(bool)))
+    support = int(mask.sum())
+    support_frac = float(support / len(mask)) if len(mask) else 0.0
+
+    # --- Log to MLflow ---
+    with mlflow.start_run(run_name=f"DETECT_{dataset_name}"):
+        mlflow.log_param("detect_method", method)
+        mlflow.log_param("detect_protected_list", ",".join(protected_list))
+        mlflow.log_param("detect_continuous_list", ",".join(continuous_list))
+        mlflow.log_param("detect_n_samples", n_samples)
+        if seed is not None:
+            mlflow.log_param("detect_seed", seed)
+        if method_kwargs:
+            mlflow.log_param("detect_method_kwargs", json.dumps(method_kwargs))
+
+        mlflow.log_metric("detect_value", float(value))
+        mlflow.log_metric("detect_abs_delta", abs_delta)
+        mlflow.log_metric("detect_signed_delta", signed_delta)
+        mlflow.log_metric("detect_support", support)
+        mlflow.log_metric("detect_support_frac", support_frac)
+
+        # Persist the rule
+        raw_rule = [
+            {"feature_index": int(idx), "bin": str(binop)} for idx, binop in (rule or [])
+        ]
+        with open("detect_rule.json", "w") as f:
+            json.dump(
+                {
+                    "dataset": dataset_name,
+                    "method": method,
+                    "protected_list": protected_list,
+                    "continuous_list": continuous_list,
+                    "value": float(value),
+                    "abs_delta": abs_delta,
+                    "signed_delta": signed_delta,
+                    "support": support,
+                    "support_frac": support_frac,
+                    "rule_human": pretty,
+                    "rule_raw": raw_rule,
+                },
+                f,
+                indent=2,
+            )
+        mlflow.log_artifact("detect_rule.json")
+
+    print(f"\n🧭 DETECT — method={method} value={value:.4f}")
+    print(f"Subgroup: {pretty}  (support={support}, signed_delta={signed_delta:.4f})")
 
 
 # ---------------------------------------------------------------------------
@@ -981,13 +1190,14 @@ if __name__ == "__main__":
         print(
             "Usage: python run_mlflow.py <dataset_name> <preprocessing_name> <postprocessing_name> [search_algo]\n"
             "  dataset_name: custom | adult | compas\n"
-            "  preprocessing_name: Reweighing | _ (ignored for FACTS/GLANCE)\n"
-            "  postprocessing_name: EqOddsPostprocessing | CalibratedEqOddsPostprocessing | RejectOptionClassification | FACTS | GLANCE\n"
+            "  preprocessing_name: Reweighing | _ (ignored for FACTS/GLANCE/DETECT)\n"
+            "  postprocessing_name: EqOddsPostprocessing | CalibratedEqOddsPostprocessing | RejectOptionClassification | FACTS | GLANCE | DETECT\n"
             "  search_algo: tpe | rand   (default: tpe)\n\n"
             "Examples:\n"
             "  python run_mlflow.py custom Reweighing EqOddsPostprocessing tpe\n"
             "  python run_mlflow.py adult _ FACTS\n"
             "  python run_mlflow.py compas _ GLANCE\n"
+            "  python run_mlflow.py adult _ DETECT\n"
         )
         sys.exit(1)
 
@@ -1010,6 +1220,11 @@ if __name__ == "__main__":
     # GLANCE-only path
     if postprocessing_name.strip().upper() == "GLANCE":
         run_glance_experiment(dataset_name, cfg)
+        sys.exit(0)
+
+    # DETECT-only path (MSD / L∞)
+    if postprocessing_name.strip().upper() == "DETECT":
+        run_detect_experiment(dataset_name, cfg)
         sys.exit(0)
 
     # Regular path with mitigation + FLAML
