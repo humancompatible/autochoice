@@ -1,53 +1,90 @@
 """
-data_loading
-============
+data_helper
+===========
 
-Hydra-driven MLflow initialization and dataset loaders used by both the
-training pipeline and the Voilá frontend.
+Hydra-friendly helpers for:
 
-Public API:
-- init_mlflow_from_cfg
-- mlflow_client_from_cfg
-- load_custom_dataset
-- load_openml_adult
-- load_compas_dataset
+- MLflow initialization from config
+- Dataset loaders:
+  * load_custom_dataset(...)  -> build multiclass label from automatch_score, add is_privileged
+  * load_openml_adult(...)    -> OpenML Adult; add is_privileged from sex; build income_binary
+  * load_compas_dataset(...)  -> COMPAS; add is_privileged from race ('Caucasian'); label two_year_recid
+- Converting pandas DataFrames into AIF360 StandardDataset safely (no MultiIndex issues)
+
+All functions include Sphinx-friendly docstrings.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
-from mlflow.tracking import MlflowClient
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.linear_model import LogisticRegression
-
-from aif360.datasets import StandardDataset
 from omegaconf import DictConfig
 
-try:
-    # Optional convenience loader for Adult
-    from aif360.sklearn.datasets.openml_datasets import fetch_adult
-except Exception:  # pragma: no cover
-    fetch_adult = None  # type: ignore
-
-__all__ = [
-    "init_mlflow_from_cfg",
-    "mlflow_client_from_cfg",
-    "load_custom_dataset",
-    "load_openml_adult",
-    "load_compas_dataset",
-]
+from aif360.datasets import CompasDataset, StandardDataset
+from aif360.sklearn.datasets.openml_datasets import fetch_adult
 
 
 # ---------------------------------------------------------------------------
-# Internal helper
+# MLflow init
+# ---------------------------------------------------------------------------
+
+def init_mlflow_from_cfg(cfg: DictConfig) -> None:
+    """
+    Initialize MLflow using a Hydra config.
+
+    Expected config structure
+    -------------------------
+    cfg.mlflow.tracking_uri : str
+        MLflow tracking server, e.g. ``"http://192.168.1.151:5000"``.
+    cfg.mlflow.registry_uri : Optional[str]
+        Model registry URI (may be ``null``).
+    cfg.mlflow.experiment_name : str
+        Name of the experiment to use/create.
+    cfg.mlflow.autolog : bool
+        If true, enable MLflow autolog for sklearn.
+    cfg.mlflow.flavor : str
+        MLflow autolog flavor, e.g. ``"sklearn"``.
+    cfg.mlflow.env : Dict[str, str]
+        Extra environment variables to export (e.g., S3/TLS settings).
+
+    Parameters
+    ----------
+    cfg : DictConfig
+        Hydra config object.
+    """
+    mlflow_cfg = cfg.get("mlflow", {}) if hasattr(cfg, "get") else {}
+    # export env first
+    for k, v in (mlflow_cfg.get("env") or {}).items():
+        if v is not None:
+            os.environ[str(k)] = str(v)
+
+    tracking_uri = mlflow_cfg.get("tracking_uri")
+    registry_uri = mlflow_cfg.get("registry_uri")
+    experiment_name = mlflow_cfg.get("experiment_name", "Default")
+    autolog_enabled = bool(mlflow_cfg.get("autolog", True))
+    flavor = mlflow_cfg.get("flavor", "sklearn")
+
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+    if registry_uri:
+        mlflow.set_registry_uri(registry_uri)
+
+    # ensure experiment exists
+    mlflow.set_experiment(experiment_name)
+
+    # autolog (sklearn flavor commonly used here)
+    if autolog_enabled and flavor.lower() == "sklearn":
+        import mlflow.sklearn as ml_sklearn
+
+        ml_sklearn.autolog()
+
+
+# ---------------------------------------------------------------------------
+# AIF360 conversion utility (MultiIndex-safe)
 # ---------------------------------------------------------------------------
 
 def _convert_to_standard_dataset(
@@ -58,38 +95,60 @@ def _convert_to_standard_dataset(
     categorical_infer: bool = True,
     scores_name: str = "",
 ) -> StandardDataset:
-    """Convert a pandas DataFrame into an AIF360 StandardDataset.
+    """
+    Convert a pandas DataFrame into an AIF360 StandardDataset.
 
-    Assumes a binary protected indicator column exists (default: ``is_privileged`` 0/1).
+    This function ensures the index is flattened (no MultiIndex) to avoid
+    pandas → AIF360 issues when converting index to string.
 
-    Args:
-        df: Input DataFrame including the binary protected indicator column.
-        target_label_name: Name of the target/label column.
-        favorable_classes: Values considered favorable for the target.
-        protected_is_privileged_col: Column name of 0/1 protected indicator.
-        categorical_infer: If True, encode object/category columns to integer codes.
-        scores_name: Optional scores column name.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input features + labels + protected indicator column.
+    target_label_name : str
+        Name of the label column in ``df``.
+    favorable_classes : list
+        Values of ``target_label_name`` considered favorable.
+    protected_is_privileged_col : str, default="is_privileged"
+        Name of the column that is 1 for privileged, 0 for unprivileged.
+    categorical_infer : bool, default=True
+        If True, any object/category columns are encoded with categorical codes.
+    scores_name : str, default=""
+        Optional scores column name (unused here).
 
-    Returns:
-        StandardDataset: AIF360 dataset ready for fairness analysis.
+    Returns
+    -------
+    StandardDataset
+        AIF360 dataset with numeric features and labels.
     """
     if target_label_name not in df.columns:
         raise KeyError(f"Target column '{target_label_name}' not found.")
     if protected_is_privileged_col not in df.columns:
         raise KeyError(f"Protected indicator '{protected_is_privileged_col}' not found.")
 
-    selected_features = df.columns.tolist()
-    df_clean = df.dropna(subset=[target_label_name, protected_is_privileged_col])
+    df_clean = df.dropna(subset=[target_label_name, protected_is_privileged_col]).copy()
 
+    # 🔧 Flatten index to avoid MultiIndex -> astype(str) error in AIF360
+    if isinstance(df_clean.index, pd.MultiIndex) or not isinstance(df_clean.index, pd.RangeIndex):
+        df_clean.reset_index(drop=True, inplace=True)
+
+    # Encode categoricals to integer codes
     categorical_features: List[str] = []
     if categorical_infer:
         categorical_features = df_clean.select_dtypes(include=["object", "category"]).columns.tolist()
         for col in categorical_features:
             df_clean[col] = df_clean[col].astype("category").cat.codes
 
-    if df_clean[target_label_name].dtype.name in ("object", "category"):
-        df_clean[target_label_name] = df_clean[target_label_name].astype("category").cat.codes
+    # Labels must be integers
+    if df_clean[target_label_name].dtype.name in ("object", "category", "bool"):
+        # If label is boolean or category, map to ints
+        if df_clean[target_label_name].dtype.name == "bool":
+            df_clean[target_label_name] = df_clean[target_label_name].astype(int)
+        else:
+            df_clean[target_label_name] = df_clean[target_label_name].astype("category").cat.codes
     df_clean[target_label_name] = df_clean[target_label_name].astype(int)
+
+    selected_features = df_clean.columns.tolist()
 
     return StandardDataset(
         df=df_clean,
@@ -103,30 +162,60 @@ def _convert_to_standard_dataset(
     )
 
 
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
 def load_custom_dataset(
-    dataset_path: str = "/data/dataset1M.parquet",
+    dataset_path: str,
+    *,
     function_filter_value: str = "Legal",
     target_from: str = "automatch_score",
-    target_bins: Tuple[float, float, float] = (0.6, 0.85, np.inf),
+    target_bins: Tuple[float, float, float] = (0.6, 0.85, float("inf")),
     target_label_name: str = "target_class",
     protected_attribute: str = "experiences_no",
     protected_threshold: int = 2,
 ) -> Tuple[pd.DataFrame, StandardDataset, List[Dict[str, int]], List[Dict[str, int]], str]:
-    """Load and prepare the custom parquet dataset.
+    """
+    Load and prepare your custom parquet dataset for AIF360.
 
-    Steps:
-      1) Read schema, exclude heavy/unused columns, ensure ``job.function`` present.
-      2) Filter rows where ``job.function == function_filter_value``.
-      3) Create multiclass target from ``automatch_score`` via ``target_bins``.
-      4) Create ``is_privileged`` from ``protected_attribute`` threshold.
-      5) Convert to AIF360 StandardDataset (favorable class = 2).
+    Steps
+    -----
+    - Select columns (exclude heavy/text), keep ``job.function`` for filtering
+    - Filter to ``job.function == function_filter_value`` and drop that column
+    - Build multiclass label from ``target_from`` using ``target_bins``
+    - Add ``is_privileged`` = 1 if ``protected_attribute > protected_threshold`` else 0
+    - Convert to AIF360 StandardDataset (favorable class is the top bin)
 
-    Returns:
-        (processed_df, aif_data, privileged_groups, unprivileged_groups, target_label_name)
+    Parameters
+    ----------
+    dataset_path : str
+        Absolute path to the parquet file (mounted in container at ``/data``).
+    function_filter_value : str, default="Legal"
+    target_from : str, default="automatch_score"
+    target_bins : tuple, default=(0.6, 0.85, inf)
+        Right-open cuts for three classes: ``(-inf, b0]``, ``(b0, b1]``, ``(b1, inf)``.
+    target_label_name : str, default="target_class"
+    protected_attribute : str, default="experiences_no"
+    protected_threshold : int, default=2
+
+    Returns
+    -------
+    data : pd.DataFrame
+        Cleaned dataframe with label and ``is_privileged``.
+    aif_data : StandardDataset
+        AIF360 dataset.
+    privileged_groups : list[dict]
+        ``[{"is_privileged": 1}]``
+    unprivileged_groups : list[dict]
+        ``[{"is_privileged": 0}]``
+    target_label_name : str
+        Name of the label column.
     """
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset not found at {dataset_path}.")
 
+    # Determine included columns
     df_schema = pd.read_parquet(dataset_path, engine="pyarrow", columns=None)
     all_columns = df_schema.columns.tolist()
     exclude = [
@@ -145,200 +234,229 @@ def load_custom_dataset(
     data = pd.read_parquet(dataset_path, columns=include_columns)
     data.columns = data.columns.str.strip().str.lower()
 
-    if "job.function" not in data.columns:
+    # Filter to a specific function and drop the column
+    if "job.function" in data.columns:
+        data = data[data["job.function"] == function_filter_value].copy()
+        data.drop(columns=["job.function"], inplace=True)
+    else:
         raise KeyError("Column 'job.function' not found in dataset.")
-    data = data[data["job.function"] == function_filter_value].drop(columns=["job.function"])
 
+    # Build multiclass label from target_from
     if target_from not in data.columns:
         raise KeyError(f"Column '{target_from}' not found in dataset.")
-    bins = [-np.inf, target_bins[0], target_bins[1], target_bins[2]]
-    data[target_label_name] = pd.cut(data[target_from], bins=bins, labels=[0, 1, 2]).astype(int)
+    b0, b1, b2 = target_bins
+    data[target_label_name] = pd.cut(
+        data[target_from],
+        bins=[-np.inf, b0, b1, b2],
+        labels=[0, 1, 2],
+    ).astype(int)
 
+    print("\n🎯 Using multiclass target from 'automatch_score':")
+    print("  ➤ Class 0: Low match (< 0.6)")
+    print("  ➤ Class 1: Medium match (0.6 - 0.85)")
+    print("  ➤ Class 2: High match (> 0.85)")
+
+    # Protected indicator
     if protected_attribute not in data.columns:
-        raise KeyError(f"Protected attribute '{protected_attribute}' not found in dataset.")
+        raise KeyError(f"Protected attribute '{protected_attribute}' not found.")
     data["is_privileged"] = (data[protected_attribute] > protected_threshold).astype(int)
 
+    print(f"\n🛡️ Using '{protected_attribute}' as protected attribute.")
+    print(f"   ➔ Privileged group: {protected_attribute} > {protected_threshold}")
+    print(f"   ➔ Unprivileged group: {protected_attribute} <= {protected_threshold}")
+
+    # Convert to AIF360
     aif_data = _convert_to_standard_dataset(
         df=data,
         target_label_name=target_label_name,
-        favorable_classes=[2],
+        favorable_classes=[2],  # top bin is favorable
         protected_is_privileged_col="is_privileged",
         categorical_infer=True,
-        scores_name="",
     )
-
     privileged_groups = [{"is_privileged": 1}]
     unprivileged_groups = [{"is_privileged": 0}]
     return data, aif_data, privileged_groups, unprivileged_groups, target_label_name
 
+
 def load_openml_adult(
+    *,
     random_seed: int = 42,
     train_size: float = 0.7,
-    build_pipeline: bool = True,
+    build_pipeline: bool = False,
     return_aif360: bool = True,
     protected_for_aif: str = "sex",
     favorable_label_for_aif: str = ">50K",
 ) -> Dict[str, Any]:
-    """Load the OpenML Adult dataset with optional AIF360 dataset and sklearn pipeline."""
-    if fetch_adult is None:
-        raise RuntimeError("AIF360 sklearn OpenML loaders are unavailable. Install the appropriate extras.")
+    """
+    Load the OpenML *Adult* dataset using AIF360's helper, and optionally build AIF360 dataset.
 
+    Parameters
+    ----------
+    random_seed : int, default=42
+    train_size : float, default=0.7
+        Not used here directly but kept for parity with examples.
+    build_pipeline : bool, default=False
+        Reserved for user code that wants a sklearn Pipeline.
+    return_aif360 : bool, default=True
+        If True, also return an AIF360 StandardDataset.
+    protected_for_aif : str, default="sex"
+        Protected attribute to derive ``is_privileged`` from (``Male`` considered privileged).
+    favorable_label_for_aif : str, default=">50K"
+        Favorable income group.
+
+    Returns
+    -------
+    info : dict
+        Keys:
+          - "X" : pd.DataFrame
+          - "y" : pd.Series
+          - "aif_data" : StandardDataset (if return_aif360)
+          - "privileged_groups" / "unprivileged_groups"
+    """
     X, y, sample_weight = fetch_adult()
     df = X.copy()
     df["income"] = y
 
-    drop_cols = ["income"]
-    if return_aif360:
-        drop_cols.append(protected_for_aif)
-    df = df.dropna(subset=drop_cols)
+    # A simple "cleaning" step: ensure categories stay as strings (no encoding yet)
+    # Add protected indicator
+    if protected_for_aif not in df.columns:
+        raise KeyError(f"Protected attribute '{protected_for_aif}' not found in Adult dataset.")
+    df["is_privileged"] = (df[protected_for_aif].astype(str).str.lower() == "male").astype(int)
 
-    y_series = df["income"]
-    X_df = df.drop(columns=["income"])
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_df, y_series, train_size=train_size, random_state=random_seed, stratify=y_series
-    )
+    # Binary target: 1 if favorable label, else 0
+    df["income_binary"] = (df["income"] == favorable_label_for_aif).astype(int)
 
-    categorical_features = X_df.select_dtypes(include=["object", "category"]).columns.to_list()
-    onehot = ColumnTransformer(
-        transformers=[("one-hot-encoder", OneHotEncoder(handle_unknown="ignore"), categorical_features)],
-        remainder="passthrough",
-    )
-
-    result: Dict[str, Any] = {
-        "X_train": X_train,
-        "X_test": X_test,
-        "y_train": y_train,
-        "y_test": y_test,
-        "categorical_features": categorical_features,
-    }
-
-    if build_pipeline:
-        model = Pipeline(
-            steps=[
-                ("one-hot-encoder", onehot),
-                ("clf", LogisticRegression(max_iter=1500)),
-            ]
-        )
-        result["pipeline"] = model
+    info: Dict[str, Any] = {"X": df.drop(columns=["income_binary"]), "y": df["income_binary"]}
 
     if return_aif360:
-        if protected_for_aif not in df.columns:
-            raise KeyError(f"Protected attribute '{protected_for_aif}' not in Adult dataset.")
-
-        if protected_for_aif == "sex":
-            protected_indicator = (df["sex"].astype(str).str.lower() == "male").astype(int)
-        else:
-            top_cat = df[protected_for_aif].astype(str).mode().iloc[0]
-            protected_indicator = (df[protected_for_aif].astype(str) == top_cat).astype(int)
-
-        df_aif = df.copy()
-        df_aif["is_privileged"] = protected_indicator
-        df_aif["income_binary"] = (df_aif["income"] == favorable_label_for_aif).astype(int)
-
+        aif_df = df.copy()
         aif_data = _convert_to_standard_dataset(
-            df=df_aif.drop(columns=["income"]),
+            df=aif_df,
             target_label_name="income_binary",
             favorable_classes=[1],
             protected_is_privileged_col="is_privileged",
             categorical_infer=True,
-            scores_name="",
         )
-        privileged_groups = [{"is_privileged": 1}]
-        unprivileged_groups = [{"is_privileged": 0}]
+        info["aif_data"] = aif_data
+        info["privileged_groups"] = [{"is_privileged": 1}]
+        info["unprivileged_groups"] = [{"is_privileged": 0}]
 
-        result.update(
-            {
-                "aif_data": aif_data,
-                "privileged_groups": privileged_groups,
-                "unprivileged_groups": unprivileged_groups,
-            }
-        )
+    return info
 
-    return result
 
 def load_compas_dataset() -> Tuple[StandardDataset, List[Dict[str, int]], List[Dict[str, int]], str]:
-    """Load the COMPAS dataset via AIF360."""
-    try:
-        from aif360.datasets import CompasDataset
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("AIF360 CompasDataset unavailable. Install AIF360 with datasets extras.") from e
-
-    compas = CompasDataset()
-    if "sex" in compas.protected_attribute_names:
-        privileged_groups = [{"sex": 1}]
-        unprivileged_groups = [{"sex": 0}]
-    else:
-        privileged_groups = [{"race": 1}]
-        unprivileged_groups = [{"race": 0}]
-
-    target_label = compas.label_names[0] if compas.label_names else "two_year_recid"
-    return compas, privileged_groups, unprivileged_groups, target_label
-
-
-
-def init_mlflow_from_cfg(cfg: DictConfig) -> None:
-    """Initialize MLflow strictly from a Hydra/OmegaConf config.
-
-    Expected YAML structure under ``mlflow``:
-      tracking_uri: "http://mlflow:5000"
-      registry_uri: null
-      experiment_name: "legal-matching"
-      autolog: true
-      flavor: "sklearn"   # or "all", "pytorch", "xgboost", ...
-      env: { ... }        # optional env vars
     """
-    if not hasattr(cfg, "mlflow"):
-        raise RuntimeError("Config missing 'mlflow' section.")
+    Load COMPAS via AIF360 and convert to a StandardDataset with a unified ``is_privileged`` flag.
 
-    mlcfg = cfg.mlflow
+    Notes
+    -----
+    - Protected group is derived from ``race == 'Caucasian'`` (privileged).
+    - Label ``two_year_recid`` is favorable when 0 (did **not** recidivate).
 
-    env: Optional[Mapping[str, Any]] = mlcfg.get("env")
-    if env:
-        for k, v in env.items():
-            os.environ[str(k)] = str(v)
+    Returns
+    -------
+    aif_data : StandardDataset
+    privileged_groups : list[dict]
+    unprivileged_groups : list[dict]
+    target_label_name : str
+    """
+    compas = CompasDataset()
+    df, attrs = compas.convert_to_dataframe(de_dummy_code=True)
+    label_name = attrs["label_names"][0]  # usually 'two_year_recid'
 
-    tracking_uri = mlcfg.get("tracking_uri")
-    if not tracking_uri:
-        raise RuntimeError("cfg.mlflow.tracking_uri is required.")
-    mlflow.set_tracking_uri(tracking_uri)
+    # Define is_privileged from race
+    if "race" not in df.columns:
+        raise KeyError("Expected 'race' in COMPAS dataset.")
+    df["is_privileged"] = (df["race"].astype(str) == "Caucasian").astype(int)
 
-    registry_uri = mlcfg.get("registry_uri")
-    if registry_uri:
-        mlflow.set_registry_uri(registry_uri)
+    # Ensure label is int; favorable = 0 (no recidivism)
+    df[label_name] = pd.to_numeric(df[label_name], errors="coerce").fillna(1).astype(int)
 
-    experiment_name = mlcfg.get("experiment_name")
-    if experiment_name:
-        mlflow.set_experiment(experiment_name)
-
-    if mlcfg.get("autolog", True):
-        flavor = mlcfg.get("flavor", "sklearn")
-        try:
-            if flavor == "sklearn":
-                import mlflow.sklearn as mls; mls.autolog()
-            elif flavor == "pytorch":
-                import mlflow.pytorch as mlpt; mlpt.autolog()
-            elif flavor == "xgboost":
-                import mlflow.xgboost as mlx; mlx.autolog()
-            elif flavor == "lightgbm":
-                import mlflow.lightgbm as mll; mll.autolog()
-            elif flavor == "catboost":
-                import mlflow.catboost as mlc; mlc.autolog()
-            elif flavor == "fastai":
-                import mlflow.fastai as mlf; mlf.autolog()
-            elif flavor == "transformers":
-                import mlflow.transformers as mlt; mlt.autolog()
-            elif flavor == "all":
-                mlflow.autolog()
-            else:
-                mlflow.autolog()
-        except Exception:
-            mlflow.autolog()
-
-
-def mlflow_client_from_cfg(cfg: DictConfig) -> MlflowClient:
-    """Create an MlflowClient that matches Hydra config."""
-    init_mlflow_from_cfg(cfg)
-    return MlflowClient(
-        tracking_uri=cfg.mlflow.tracking_uri,
-        registry_uri=cfg.mlflow.get("registry_uri"),
+    aif_data = _convert_to_standard_dataset(
+        df=df,
+        target_label_name=label_name,
+        favorable_classes=[0],
+        protected_is_privileged_col="is_privileged",
+        categorical_infer=True,
     )
+    privileged_groups = [{"is_privileged": 1}]
+    unprivileged_groups = [{"is_privileged": 0}]
+    return aif_data, privileged_groups, unprivileged_groups, label_name
+
+
+# ---------------------------------------------------------------------------
+# Convenience for "repair" experiments
+# ---------------------------------------------------------------------------
+
+def get_repair_ready_dataframe(
+    dataset_name: str = "adult",
+    *,
+    protected_attr: Optional[str] = None,
+    favorable_label_for_aif: str = ">50K",
+) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Return a pandas DataFrame + names useful for the 'repair' toolkit experiments.
+
+    By default this returns the OpenML Adult dataset with:
+      - label column: 'income_binary' (1 if income == '>50K', else 0)
+      - protected attribute column: 'sex' (string values kept as-is)
+      - also includes a convenience boolean/indicator column 'is_privileged' (Male=1)
+
+    Parameters
+    ----------
+    dataset_name : {'adult', 'compas', 'custom'}, default='adult'
+        Currently optimized for 'adult'. Other datasets will be returned in
+        their AIF360-to-DataFrame form with the label column preserved.
+    protected_attr : str, optional
+        Name of the protected attribute column to expose in the returned DataFrame.
+        If None, defaults to:
+           - 'sex' for 'adult'
+           - 'race' for 'compas'
+           - 'is_privileged' for 'custom' (since the raw protected attribute is domain-specific)
+    favorable_label_for_aif : str, default='>50K'
+        Only used for 'adult' to define 'income_binary'.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        DataFrame including the label column and a human-readable protected attribute column.
+    label_col : str
+        Name of the label column in `df`.
+    protected_col : str
+        Name of the protected attribute column in `df`.
+    """
+    name = (dataset_name or "adult").lower()
+
+    if name == "adult":
+        X, y, _ = fetch_adult()
+        df = X.copy()
+        df["income"] = y
+        prot_col = protected_attr or "sex"
+        if prot_col not in df.columns:
+            raise KeyError(f"Protected attribute '{prot_col}' not found in Adult dataset.")
+        df["is_privileged"] = (df[prot_col].astype(str).str.lower() == "male").astype(int)
+        df["income_binary"] = (df["income"] == favorable_label_for_aif).astype(int)
+        return df, "income_binary", prot_col
+
+    if name == "compas":
+        compas = CompasDataset()
+        df, attrs = compas.convert_to_dataframe(de_dummy_code=True)
+        label_name = attrs["label_names"][0]
+        prot_col = protected_attr or "race"
+        if prot_col not in df.columns:
+            raise KeyError(f"Protected attribute '{prot_col}' not found in COMPAS dataset.")
+        # unify helper column
+        df["is_privileged"] = (df["race"].astype(str) == "Caucasian").astype(int)
+        # ensure int label
+        df[label_name] = pd.to_numeric(df[label_name], errors="coerce").fillna(1).astype(int)
+        return df, label_name, prot_col
+
+    if name == "custom":
+        # For custom data, we cannot reload parquet here generically;
+        # downstream code should pass through load_custom_dataset and operate on that df.
+        raise NotImplementedError(
+            "get_repair_ready_dataframe('custom'): please load your DataFrame first with "
+            "load_custom_dataset(...) and use the returned DataFrame directly."
+        )
+
+    raise ValueError("dataset_name must be one of: 'adult', 'compas', 'custom'.")
